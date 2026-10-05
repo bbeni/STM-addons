@@ -207,7 +207,8 @@ class MapView(pg.PlotWidget):
                                           pen=pg.mkPen(color, width=2, style=Qt.DashLine)))
 
     def draw_approaches(self, approaches):
-        def describe_approach(x, y, approach):
+        def describe_approach(x, y, data):  # pyqtgraph passes these as keywords
+            approach = data
             if approach.z_nm is None:
                 return f"approach #{approach.seq}: height unknown"
             assumed = " (assumed: steps unknown)" if approach.z_assumed else ""
@@ -254,7 +255,7 @@ class MapView(pg.PlotWidget):
             x_nm, y_nm = nx_nm, ny_nm
 
     def draw_tip(self, state, color):
-        self.add(None, pg.ScatterPlotItem([state.x_nm], [state.y_nm], symbol="star", size=20,
+        self.add(None, pg.ScatterPlotItem([state.x_nm], [state.y_nm], symbol="star", size=20, tip=None,
                                            pen=pg.mkPen("w"), brush=pg.mkBrush(color)))
 
     def draw_labels(self, labels):
