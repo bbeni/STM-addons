@@ -282,3 +282,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# cartographer: per-STM config and recorded histories
+cartographer/config.toml
+*.jsonl

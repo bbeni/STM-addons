@@ -1,0 +1,10 @@
+name: stm-addons
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pyqt
+  - pyqtgraph
+  - pip
+  - pip:
+      - nanonis-spm
