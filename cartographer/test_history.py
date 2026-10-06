@@ -1,13 +1,15 @@
 import json
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 
+from config import DEFAULT_CONFIG, load_config
 from history import (
-    Annotate, ApproachStart, ApproachSteps, ApproachStop, Crash, HistoryError,
+    Annotate, ApproachStart, ApproachSteps, ApproachStop, Crash, Delete, HistoryError,
     HistoryFile, Move, MoveStop, OnSample, Sample, SessionStart, read_history,
 )
-from timeline import Timeline, path_to, replay
+from timeline import Timeline, arrange, path_to, replay
 
 STEP_NM = {"x+": 100.0, "x-": 120.0, "y+": 80.0, "y-": 80.0, "z+": 50.0, "z-": 40.0}
 
@@ -53,7 +55,7 @@ class FileFormatTest(TempDirTest):
     def test_header_and_readable_lines(self):
         HistoryFile(self.path).append(move("x+", 10))
         header, line = self.path.read_text().splitlines()
-        self.assertEqual(json.loads(header)["version"], 1)
+        self.assertEqual(json.loads(header)["version"], 2)
         self.assertEqual(list(json.loads(line))[:3], ["seq", "time", "type"])
 
     def test_reopen_continues_numbering(self):
@@ -62,9 +64,24 @@ class FileFormatTest(TempDirTest):
         self.assertEqual(event.seq, 1)
 
     def test_rejects_newer_version(self):
-        self.path.write_text(json.dumps({"format": "cartographer-history", "version": 2}) + "\n")
-        with self.assertRaisesRegex(HistoryError, "version 2"):
+        self.path.write_text(json.dumps({"format": "cartographer-history", "version": 3}) + "\n")
+        with self.assertRaisesRegex(HistoryError, "version 3"):
             read_history(self.path)
+
+    def test_reads_version_1(self):
+        self.path.write_text(
+            json.dumps({"format": "cartographer-history", "version": 1}) + "\n"
+            + '{"seq": 0, "time": "2026-10-05T17:51:02+02:00", "type": "sample", "name": "Au(111)", "description": ""}\n')
+        self.assertEqual(read_history(self.path)[0].name, "Au(111)")
+
+    def test_after_seq_written_only_when_set(self):
+        history = HistoryFile(self.path)
+        history.append(Annotate(tags=["dirty"], radius_nm=1.0))
+        history.append(Annotate(tags=["clean"], radius_nm=1.0, after_seq=0))
+        _, plain, inserted = self.path.read_text().splitlines()
+        self.assertNotIn("after_seq", json.loads(plain))
+        self.assertEqual(list(json.loads(inserted))[:4], ["seq", "time", "type", "after_seq"])
+        self.assertEqual(read_history(self.path), history.events)
 
     def test_rejects_invalid_move(self):
         with self.assertRaises(ValueError):
@@ -145,8 +162,109 @@ class ReplayTest(unittest.TestCase):
     def test_long_path_is_split(self):
         state = replay(self.events[:1])
         target = replay(self.events[:1])
-        target.x_nm = 100.0 * (2**16 + 10)
-        self.assertEqual(path_to(state, target), [("x+", 2**16), ("x+", 10)])
+        target.x_nm = 100.0 * (65535 + 10)  # Nanonis takes at most 65535 (uint16) steps per move
+        self.assertEqual(path_to(state, target), [("x+", 65535), ("x+", 10)])
+
+    def test_approach_done_and_on_sample(self):
+        events = [SessionStart(step_nm=STEP_NM), move("x+", 10), ApproachStart(),
+                  ApproachStop(), OnSample(on_sample=False)]  # found plate, then said so
+        for seq, event in enumerate(events):
+            event.seq = seq
+        self.assertFalse(replay(events[:3]).approaches[0].done)
+        approach, = replay(events).approaches
+        self.assertTrue(approach.done)
+        self.assertFalse(approach.on_sample)
+
+
+class ArrangeTest(unittest.TestCase):
+    """Deleting and inserting: the file only grows, the timeline is arranged."""
+
+    def setUp(self):
+        self.events = example_events()
+
+    def add(self, event):
+        event.seq = len(self.events)
+        self.events.append(event)
+
+    def number(self):
+        for seq, event in enumerate(self.events):
+            event.seq = seq
+
+    def test_plain_history_is_unchanged(self):
+        self.number()
+        self.assertEqual(arrange(self.events), self.events)
+
+    def test_delete_annotation(self):
+        self.number()
+        self.add(Delete(target_seq=7))
+        timeline = arrange(self.events)
+        self.assertNotIn(7, [e.seq for e in timeline])
+        self.assertEqual(replay(timeline).marks, [])
+
+    def test_moves_cannot_be_deleted(self):
+        self.number()
+        self.add(Delete(target_seq=1))
+        with self.assertRaisesRegex(ValueError, "cannot be deleted"):
+            arrange(self.events)
+
+    def test_insert_annotation_in_the_past(self):
+        self.number()
+        self.add(Annotate(tags=["clean"], radius_nm=50.0, after_seq=1))  # right after the first move
+        timeline = arrange(self.events)
+        self.assertEqual([e.seq for e in timeline[:4]], [0, 1, 12, 2])
+        clean = [m for m in replay(timeline).marks if m.tags == ["clean"]][0]
+        self.assertEqual((clean.x_nm, clean.y_nm), (1000, 0))
+
+    def test_insert_on_sample_in_the_past(self):
+        self.number()
+        self.add(Delete(target_seq=2))  # "left the sample" was pressed one move too early
+        self.add(OnSample(on_sample=False, after_seq=3))
+        visits = replay(arrange(self.events)).visits
+        self.assertEqual([v.on_sample for v in visits], [True, True, False, False])
+
+    def test_moves_cannot_be_inserted(self):
+        self.number()
+        self.add(move("x+", 1))
+        self.events[-1].after_seq = 1
+        with self.assertRaisesRegex(ValueError, "cannot be inserted"):
+            arrange(self.events)
+
+    def test_insert_after_deleted_event_fails(self):
+        self.number()
+        self.add(Delete(target_seq=7))
+        self.add(Annotate(tags=["flat"], radius_nm=1.0, after_seq=7))
+        with self.assertRaisesRegex(ValueError, "not in the timeline"):
+            arrange(self.events)
+
+
+class ConfigTest(TempDirTest):
+    def test_missing_keys_take_defaults(self):
+        config_path = Path(self.tmp.name) / "config.toml"
+        config_path.write_text('[step_nm]\n"x+" = 1.0\n"x-" = 1.0\n"y+" = 1.0\n"y-" = 1.0\n'
+                               '"z+" = 1.0\n"z-" = 1.0\n')
+        config = load_config(config_path)
+        self.assertEqual(config["step_nm"]["z-"], 1.0)
+        self.assertEqual(config["colors"], tomllib.loads(DEFAULT_CONFIG)["colors"])
+        self.assertEqual(config["approach"]["direction"], "z-")
+
+
+class StartFolderTest(TempDirTest):
+    def test_newest_dated_folder(self):
+        from main import start_folder
+        root = Path(self.tmp.name)
+        for name in ("2026-09-30", "2026-10-03", "2026-10-03 old", "notes"):
+            (root / name).mkdir()
+        (root / "2026-12-01").write_text("a file, not a folder")
+        self.assertEqual(start_folder(root), root / "2026-10-03")
+
+    def test_falls_back_to_current_directory(self):
+        from main import start_folder
+        self.assertEqual(start_folder(Path(self.tmp.name) / "missing"), Path.cwd())
+        self.assertEqual(start_folder(self.tmp.name), Path.cwd())
+
+    def test_default_file_name(self):
+        from main import default_file_name
+        self.assertEqual(default_file_name("Au(111)", "20261006_1520"), "20261006_1520_Au_111.jsonl")
 
 
 if __name__ == "__main__":

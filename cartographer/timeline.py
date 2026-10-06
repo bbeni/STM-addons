@@ -8,15 +8,16 @@ Follow-up: we start on the sample; when it is left (or reached), assume the edge
 halfway along the last move. If the approach steps are unknown, assume the
 surface is at the height of the closest earlier approach.
 
-The state after event i is defined as the replay of events 0..i. Nothing else
-is stored, so the history file is the single source of truth.
+The state after event i is defined as the replay of events 0..i of the
+arranged timeline. Nothing else is stored, so the history file is the single
+source of truth.
 """
 
 from dataclasses import dataclass, field
 
 from history import (
-    Annotate, ApproachStart, ApproachSteps, ApproachStop, Crash, Move,
-    MoveStop, NSTEPS_MAX, OnSample, Sample, SessionStart,
+    DELETABLE, INSERTABLE, Annotate, ApproachStart, ApproachSteps, ApproachStop, Crash,
+    Delete, Move, MoveStop, NSTEPS_MAX, OnSample, Sample, SessionStart,
 )
 
 # direction -> (axis, sign)
@@ -43,6 +44,8 @@ class Approach:
     seq: int
     x_nm: float
     y_nm: float
+    on_sample: bool
+    done: bool = False  # the approach has stopped
     z_nm: float = None  # None until the steps are known or assumed
     z_assumed: bool = False  # steps were unknown: z taken from the closest approach
 
@@ -92,6 +95,33 @@ class State:
         return (self.x_nm, self.y_nm)
 
 
+def arrange(events):
+    """The timeline as shown and replayed, from the events in file order:
+    an event with after_seq moves right behind that event, a delete removes
+    its target, and the delete itself is left out."""
+    timeline = []
+
+    def position(seq, event):
+        for index, other in enumerate(timeline):
+            if other.seq == seq:
+                return index
+        raise ValueError(f"seq {event.seq}: refers to {seq}, which is not in the timeline")
+
+    for event in events:
+        if isinstance(event, Delete):
+            index = position(event.target_seq, event)
+            if not isinstance(timeline[index], DELETABLE):
+                raise ValueError(f"seq {event.seq}: a {timeline[index].type} cannot be deleted")
+            del timeline[index]
+        elif event.after_seq is not None:
+            if not isinstance(event, INSERTABLE):
+                raise ValueError(f"seq {event.seq}: a {event.type} cannot be inserted earlier")
+            timeline.insert(position(event.after_seq, event) + 1, event)
+        else:
+            timeline.append(event)
+    return timeline
+
+
 def replay(events):
     state = State()
     for event in events:
@@ -136,10 +166,12 @@ def apply(state, event):
 
         case ApproachStart():
             state.approaching = True
-            state.approaches.append(Approach(event.seq, state.x_nm, state.y_nm))
+            state.approaches.append(Approach(event.seq, state.x_nm, state.y_nm, state.on_sample))
 
         case ApproachStop():
             state.approaching = False
+            if state.approaches:
+                state.approaches[-1].done = True
 
         case ApproachSteps():
             require_session(state, event)
@@ -169,7 +201,12 @@ def apply(state, event):
         case OnSample():
             state.on_sample = event.on_sample
             if state.visits:
-                state.visits[-1].on_sample = event.on_sample  # where we are now
+                visit = state.visits[-1]  # where we are now
+                visit.on_sample = event.on_sample
+                # approaches made here usually tell whether it is the sample: they count too
+                for approach in state.approaches:
+                    if approach.seq > visit.seq:
+                        approach.on_sample = event.on_sample
 
         case _:
             raise ValueError(f"cannot replay event {event!r}")

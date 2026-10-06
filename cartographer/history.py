@@ -10,6 +10,13 @@ Format: JSON Lines (one JSON object per line, UTF-8).
   - every further line is one event, numbered by "seq" (0, 1, 2, ...)
 Events are only ever appended, never edited, so a crash can lose at most the
 line being written, and the file reads like a lab logbook.
+
+Version 2 (prompt, 2026-10-06): "make it that history elements can be deleted
+(if wrongly annotated for example). if we go back in history and add a new
+annotation, it is inserted at that position." Both are new appended events: a
+`delete` names the event it removes, and an event with `after_seq` belongs
+right after that event. The file stays a complete logbook; timeline.arrange()
+builds the order that is shown and replayed.
 """
 
 import json
@@ -19,10 +26,11 @@ from datetime import datetime
 from pathlib import Path
 
 FORMAT_NAME = "cartographer-history"
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
+READABLE_VERSIONS = (1, 2)  # version 1 is version 2 without delete and after_seq
 
 DIRECTIONS = ("x+", "x-", "y+", "y-", "z+", "z-")
-NSTEPS_MAX = 2**16  # Nanonis limit per Motor_StartMove
+NSTEPS_MAX = 2**16 - 1  # Nanonis takes the steps of one Motor_StartMove as uint16
 
 
 def now():
@@ -46,6 +54,8 @@ def check_steps(direction, nsteps, nsteps_max=NSTEPS_MAX):
 class Event:
     seq: int = field(default=-1, kw_only=True)  # assigned on append
     time: str = field(default_factory=now, kw_only=True)
+    # set: recorded later, but belongs right after event after_seq in the timeline
+    after_seq: int | None = field(default=None, kw_only=True)
 
 
 @dataclass
@@ -145,16 +155,34 @@ class OnSample(Event):
     on_sample: bool
 
 
+@dataclass
+class Delete(Event):
+    """Removes event target_seq from the timeline, e.g. a wrong annotation.
+    The deleted line stays in the file."""
+
+    type = "delete"
+    target_seq: int
+
+
 EVENT_TYPES = {cls.type: cls for cls in (
     Sample, SessionStart, Move, MoveStop, ApproachStart, ApproachStop,
-    ApproachSteps, Annotate, Crash, OnSample,
+    ApproachSteps, Annotate, Crash, OnSample, Delete,
 )}
+
+# Remarks can be deleted or added at an earlier point. What the motors did
+# (moves, stops, approaches) cannot: it happened, at the time it was recorded.
+DELETABLE = (Annotate, Crash, OnSample, ApproachSteps)
+INSERTABLE = (Annotate, Crash, OnSample)
 
 
 def event_to_dict(event):
     data = asdict(event)
+    after_seq = data.pop("after_seq")
     # keep seq, time and type first so lines are easy to scan by eye
-    return {"seq": data.pop("seq"), "time": data.pop("time"), "type": event.type, **data}
+    head = {"seq": data.pop("seq"), "time": data.pop("time"), "type": event.type}
+    if after_seq is not None:
+        head["after_seq"] = after_seq
+    return {**head, **data}
 
 
 def event_from_dict(data):
@@ -185,7 +213,7 @@ def read_history(path):
     header = json.loads(lines[0])
     if header.get("format") != FORMAT_NAME:
         raise HistoryError(f"{path}: not a {FORMAT_NAME} file")
-    if header.get("version") != FORMAT_VERSION:
+    if header.get("version") not in READABLE_VERSIONS:
         raise HistoryError(
             f"{path}: format version {header.get('version')} not supported "
             f"(this program reads version {FORMAT_VERSION})")

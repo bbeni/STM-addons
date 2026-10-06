@@ -1,8 +1,12 @@
 """Start the cartographer: choose the hardware and the history file, open the window.
 
-Intent (prompt, 2026-10-05): the sample is in focus. A new history gets a
-default sample name with date and time; the file is stored where the user
-selects, starting next to the launcher, and no folder is created.
+Intent (prompt, 2026-10-05): the sample is in focus. The file is stored where
+the user selects, and no folder is created.
+Follow-up (2026-10-06): the sample name defaults to Au(111), the file name to
+20261006_1520_Au_111.jsonl. Storing and opening start in the newest folder named
+like 2026-10-03 in E:/ (data_root in the config), which can be older than
+today; without such a folder, in the current directory. Font and layout a bit
+bigger.
 """
 
 import argparse
@@ -18,27 +22,43 @@ from backend import Nanonis, Simulator
 from config import CONFIG_PATH, load_config
 from history import HistoryFile
 
-LAUNCHER_DIR = Path(__file__).resolve().parent.parent
 FILE_FILTER = "cartographer history (*.jsonl)"
+DEFAULT_SAMPLE_NAME = "Au(111)"
+FONT_SCALE = 1.25
 
 
 def default_file_name(sample_name, stamp):
-    """Au(111) #42 -> 2026-10-05_17-52_Au_111_42.jsonl; the date is added only once."""
+    """Au(111) #42 -> 20261005_1752_Au_111_42.jsonl; the date is added only once."""
     slug = re.sub(r"[^A-Za-z0-9-]+", "_", sample_name).strip("_")
     return f"{slug if stamp in slug else f'{stamp}_{slug}'}.jsonl"
 
 
-def create_history(path=None):
+def start_folder(data_root):
+    """The newest folder in data_root named like 2026-10-03, else the current directory."""
+    dated = []
+    try:
+        for folder in Path(data_root).iterdir():
+            try:
+                dated.append((datetime.strptime(folder.name, "%Y-%m-%d"), folder))
+            except ValueError:
+                continue
+    except OSError:  # no such drive or folder, e.g. away from the STM computer
+        pass
+    dated = [(date, folder) for date, folder in dated if folder.is_dir()]
+    return max(dated)[1] if dated else Path.cwd()
+
+
+def create_history(folder, path=None):
     """Ask for the sample and where to store the history, then create it."""
-    stamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
-    dialog = SampleDialog(name=f"sample_{stamp}", title="New sample")
+    stamp = datetime.now().strftime("%Y%m%d_%H%M")
+    dialog = SampleDialog(name=DEFAULT_SAMPLE_NAME, title="New sample")
     if dialog.exec() != QDialog.Accepted:
         return None
     sample = dialog.sample()
 
     if path is None:
         path, _ = QFileDialog.getSaveFileName(
-            None, "Store the new history", str(LAUNCHER_DIR / default_file_name(sample.name, stamp)),
+            None, "Store the new history", str(folder / default_file_name(sample.name, stamp)),
             FILE_FILTER, options=QFileDialog.DontConfirmOverwrite)
         if not path:
             return None
@@ -55,10 +75,11 @@ def create_history(path=None):
     return history
 
 
-def open_or_create_history(path_argument):
+def open_or_create_history(path_argument, data_root):
+    folder = start_folder(data_root)
     if path_argument:
         path = Path(path_argument)
-        return HistoryFile(path) if path.exists() else create_history(path)
+        return HistoryFile(path) if path.exists() else create_history(folder, path)
 
     question = QMessageBox(QMessageBox.Question, "cartographer",
                            "Start a new sample, or continue an existing history?")
@@ -67,9 +88,9 @@ def open_or_create_history(path_argument):
     question.addButton(QMessageBox.Cancel)
     question.exec()
     if question.clickedButton() == new_button:
-        return create_history()
+        return create_history(folder)
     if question.clickedButton() == open_button:
-        path, _ = QFileDialog.getOpenFileName(None, "Open a history", str(LAUNCHER_DIR), FILE_FILTER)
+        path, _ = QFileDialog.getOpenFileName(None, "Open a history", str(folder), FILE_FILTER)
         return HistoryFile(path) if path else None
     return None
 
@@ -95,13 +116,16 @@ def main(argv, prog="cartographer"):
     args = parser.parse_args(argv)
 
     application = QApplication(sys.argv[:1])
+    font = application.font()
+    font.setPointSizeF(font.pointSizeF() * FONT_SCALE)
+    application.setFont(font)
     config = load_config()
     print(f"config: {CONFIG_PATH}")
 
     backend = connect(config, args.simulate)
     if backend is None:
         return
-    history = open_or_create_history(args.history)
+    history = open_or_create_history(args.history, config["files"]["data_root"])
     if history is None:
         return
 
